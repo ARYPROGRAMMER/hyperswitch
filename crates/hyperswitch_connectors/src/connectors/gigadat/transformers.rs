@@ -202,6 +202,23 @@ impl From<GigadatPaymentStatus> for enums::AttemptStatus {
     }
 }
 
+impl TryFrom<String> for GigadatPaymentStatus {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "STATUS_INITED" => Ok(Self::StatusInited),
+            "STATUS_SUCCESS" => Ok(Self::StatusSuccess),
+            "STATUS_REJECTED" => Ok(Self::StatusRejected),
+            "STATUS_REJECTED1" => Ok(Self::StatusRejected1),
+            "STATUS_EXPIRED" => Ok(Self::StatusExpired),
+            "STATUS_ABORTED1" => Ok(Self::StatusAborted1),
+            "STATUS_PENDING" => Ok(Self::StatusPending),
+            "STATUS_FAILED" => Ok(Self::StatusFailed),
+            _ => Err(errors::ConnectorError::WebhookBodyDecodingFailed.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GigadatTransactionStatusResponse {
     pub status: GigadatPaymentStatus,
@@ -422,4 +439,16 @@ pub struct GigadatRefundErrorResponse {
 pub struct Error {
     pub code: Option<String>,
     pub detail: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GigadatWebhookQueryParameters {
+    pub transaction: String,
+    pub status: GigadatPaymentStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GigadatWebhookKeyValue {
+    pub key: String,
+    pub value: String,
 }

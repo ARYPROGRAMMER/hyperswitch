@@ -2,6 +2,7 @@ pub mod transformers;
 
 use base64::Engine;
 use common_enums::enums;
+use common_utils::crypto::Encryptable;
 use common_utils::{
     consts,
     errors::CustomResult,
@@ -9,7 +10,7 @@ use common_utils::{
     request::{Method, Request, RequestBuilder, RequestContent},
     types::{AmountConvertor, FloatMajorUnit, FloatMajorUnitForConnector},
 };
-use error_stack::{report, ResultExt};
+use error_stack::ResultExt;
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
@@ -55,6 +56,7 @@ use masking::{Mask, PeekInterface};
 #[cfg(feature = "payouts")]
 use router_env::{instrument, tracing};
 use transformers as gigadat;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{constants::headers, types::ResponseRouterData, utils};
@@ -832,27 +834,126 @@ impl ConnectorIntegration<PoFulfill, PayoutsData, PayoutsResponseData> for Gigad
     }
 }
 
+fn get_webhook_query_params(
+    request: &webhooks::IncomingWebhookRequestDetails<'_>,
+) -> CustomResult<transformers::GigadatWebhookQueryParameters, errors::ConnectorError> {
+    let query_string = &request.query_params;
+    router_env::logger::info!(gigadat_webhook_query_string=?query_string);
+
+    let mut transaction = None;
+    let mut status = None;
+
+    for pair in query_string.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            match key {
+                "transaction" => transaction = Some(value.to_string()),
+                "status" => {
+                    status = Some(transformers::GigadatPaymentStatus::try_from(
+                        value.to_string(),
+                    )?);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(transformers::GigadatWebhookQueryParameters {
+        transaction: transaction.ok_or(errors::ConnectorError::WebhookBodyDecodingFailed)?,
+        status: status.ok_or(errors::ConnectorError::WebhookBodyDecodingFailed)?,
+    })
+}
+
 #[async_trait::async_trait]
 impl webhooks::IncomingWebhook for Gigadat {
     fn get_webhook_object_reference_id(
         &self,
-        _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
-        Err(report!(errors::ConnectorError::WebhooksNotImplemented))
+        let query_params = get_webhook_query_params(request)?;
+        let body_str = std::str::from_utf8(request.body)
+            .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+
+        let details: Vec<transformers::GigadatWebhookKeyValue> =
+            form_urlencoded::parse(body_str.as_bytes())
+                .map(|(key, value)| transformers::GigadatWebhookKeyValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .collect();
+
+        let transaction_type = details
+            .iter()
+            .find(|&d| d.key == "type")
+            .ok_or(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+
+        let reference_id = match transaction_type.value.as_str() {
+            "ETO" | "RTO" | "RTX" | "ANR" | "ANX" => {
+                api_models::webhooks::ObjectReferenceId::PayoutId(
+                    api_models::webhooks::PayoutIdType::ConnectorPayoutId(query_params.transaction),
+                )
+            }
+            _ => api_models::webhooks::ObjectReferenceId::PaymentId(
+                api_models::payments::PaymentIdType::ConnectorTransactionId(
+                    query_params.transaction,
+                ),
+            ),
+        };
+        Ok(reference_id)
     }
 
     fn get_webhook_event_type(
         &self,
-        _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
-        Err(report!(errors::ConnectorError::WebhooksNotImplemented))
+        let query_params = get_webhook_query_params(request)?;
+
+        let event_type = match query_params.status {
+            transformers::GigadatPaymentStatus::StatusSuccess => {
+                api_models::webhooks::IncomingWebhookEvent::PaymentIntentSuccess
+            }
+            transformers::GigadatPaymentStatus::StatusFailed
+            | transformers::GigadatPaymentStatus::StatusRejected
+            | transformers::GigadatPaymentStatus::StatusRejected1
+            | transformers::GigadatPaymentStatus::StatusExpired
+            | transformers::GigadatPaymentStatus::StatusAborted1 => {
+                api_models::webhooks::IncomingWebhookEvent::PaymentIntentFailure
+            }
+            transformers::GigadatPaymentStatus::StatusInited
+            | transformers::GigadatPaymentStatus::StatusPending => {
+                api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing
+            }
+        };
+        Ok(event_type)
     }
 
     fn get_webhook_resource_object(
         &self,
-        _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
-        Err(report!(errors::ConnectorError::WebhooksNotImplemented))
+        let body_str = std::str::from_utf8(request.body)
+            .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+
+        let details: Vec<transformers::GigadatWebhookKeyValue> =
+            form_urlencoded::parse(body_str.as_bytes())
+                .map(|(key, value)| transformers::GigadatWebhookKeyValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .collect();
+        let resource_object = serde_json::to_string(&details)
+            .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+        Ok(Box::new(resource_object))
+    }
+    async fn verify_webhook_source(
+        &self,
+        _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _connector_webhook_details: Option<common_utils::pii::SecretSerdeValue>,
+        _connector_account_details: Encryptable<masking::Secret<serde_json::Value>>,
+        _connector_label: &str,
+    ) -> CustomResult<bool, errors::ConnectorError> {
+        Ok(false)
     }
 }
 
@@ -880,7 +981,8 @@ lazy_static! {
         connector_type: enums::HyperswitchConnectorCategory::PaymentGateway,
         integration_status: enums::ConnectorIntegrationStatus::Sandbox,
     };
-    static ref GIGADAT_SUPPORTED_WEBHOOK_FLOWS: Vec<enums::EventClass> = Vec::new();
+    static ref GIGADAT_SUPPORTED_WEBHOOK_FLOWS: Vec<enums::EventClass> =
+        vec![enums::EventClass::Payments, enums::EventClass::Payouts];
 }
 
 impl ConnectorSpecifications for Gigadat {
