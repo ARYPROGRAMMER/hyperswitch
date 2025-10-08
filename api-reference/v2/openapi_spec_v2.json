@@ -15451,6 +15451,25 @@
           },
           {
             "type": "object",
+            "description": "Contains the SDK UPI intent URI for payment processing",
+            "required": [
+              "sdk_uri",
+              "type"
+            ],
+            "properties": {
+              "sdk_uri": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "sdk_upi_intent_information"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Contains the download url and the reference number for transaction",
             "required": [
               "voucher_details",
